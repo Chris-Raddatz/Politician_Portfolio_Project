@@ -1,0 +1,483 @@
+---
+title: "Finance_Data"
+author: "Team61"
+date: "2024-03-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Installing packages as needed
+
+```{r}
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(tidyquant)) install.packages("tidyquant")
+if (!require(PerformanceAnalytics)) install.packages("PerformanceAnalytics")
+if (!require(xts)) install.packages("xts")
+if (!require(lubridate)) install.packages("lubridate")
+if (!require(Quandl)) install.packages("Quandl")
+if (!require(riingo)) install.packages("riingo")
+if (!require(eeptools)) install.packages("eeptools")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(purrr)) install.packages("purrr")
+if (!require(broom)) install.packages("broom")
+if (!require(maps)) install.packages("maps")
+if (!require(ggthemes)) install.packages("ggthemes")
+if (!require(mapproj)) install.packages("mapproj")
+```
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(PerformanceAnalytics)
+library(xts)
+library(lubridate)
+library(Quandl)
+library(riingo)
+library(httr)
+library(tidyr)
+library(dplyr)
+library(jsonlite)
+library(httr)
+library(eeptools)
+library(ggplot2)
+library(purrr)
+library(broom)
+library(maps)
+library(mapproj)
+library(ggthemes)
+```
+
+# Set API keys for pulling data
+
+```{r}
+# Need to set the key so this R session can pass it to the Tiingo API
+api_key <-  "42118b51a26ca882ad30280464cbb58f5bc1631c"
+
+riingo_set_token(api_key)
+```
+
+# Get Transaction Data
+
+This section pulls all the data using CapitolTrades API, looping through pages in the response.
+
+```{r}
+#DO NOT RUN THIS: USE 'output_senator_trade_data.csv' FILE INSTEAD.
+#This takes a long amount of time to run and pull data from all the pages in the API.
+
+# Initialize variables
+base_url <- "https://bff.capitoltrades.com/trades"
+page <- 1
+all_data <- list()
+total_pages <- 2 # Placeholder, will update dynamically
+
+# Loop through pages until the current page exceeds total pages
+while (page <= total_pages) {
+  # Make API request
+  url <- sprintf("%s?pageSize=96&page=%d", base_url, page)
+  response <- GET(url)
+  
+  # Check if the request was successful
+  if (status_code(response) == 200) {
+    # Parse the JSON response
+    data <- fromJSON(content(response, "text"))
+    
+    # Update total_pages based on the response
+    total_pages <- data$meta$paging$totalPages
+    
+    # Extract the transactions data
+    transactions <- data$data
+    
+    # Check if transactions is empty, indicating end of data
+    if (length(transactions) == 0) {
+      break # Exit loop if there are no transactions
+    }
+    
+    # Add the current page's transactions to all_data
+    all_data <- c(all_data, list(transactions))
+    
+    # Move to the next page
+    page <- page + 1
+  } else {
+    cat("Failed to fetch data. HTTP status code:", status_code(response), "\n")
+    break # Exit loop in case of an HTTP error
+  }
+}
+
+# At this point, all_data contains all transactions from all fetched pages
+# Process all_data as needed
+```
+
+Once all the data is pulled, the list of the transaction data is converted into a dataframe, using `bind_rows()`, which automatically binds the rows of each list element (in this case, each page's transactions) into a single dataframe. This method is straightforward and handles varying column types well, making it suitable for JSON data that might have a complex structure.
+
+After the transactions are converted into a dataframe, we can select the rows that we need and unnest other fields like asset, politician and committees.
+
+```{r}
+# Convert the list of transactions into a single dataframe and scrub the data
+all_transactions_df <- bind_rows(all_data) %>%
+  mutate(committees = map_chr(committees, paste, collapse = ", ")) %>%
+  unnest_longer(c(asset, politician, issuer)) %>%
+  select(`_txId`, txDate, txType, asset, politician, committees, price, issuer, size, reportingGap)
+
+# Check the structure of the resulting dataframe
+str(all_transactions_df)
+
+# View the first few rows of the dataframe
+head(all_transactions_df)
+```
+
+# Export senator investment data to csv for reuse
+
+```{r}
+#export data as csv
+write.csv(all_transactions_df, "output_senator_trade_data.csv", row.names = FALSE)
+```
+
+# Import senator investment data
+
+```{r}
+#Import data using csv
+senator_investment_data <- read.csv("../Data/Scrubbed_All_CapitolTrades_Data.csv", header = TRUE)
+
+# Filter data where assetType is stocks
+senator_investment_data <- (senator_investment_data[senator_investment_data$asset.assetType == "stock",])
+```
+
+```{r}
+#filter data to include transactions from 2021 to 2022
+filtered_senator_inv <- 
+  senator_investment_data[(senator_investment_data$txDate > "2021-01-01" & senator_investment_data$txDate < "2022-12-31"),]
+
+filtered_senator_inv <- filtered_senator_inv[(filtered_senator_inv$issuer.country == "us"),]
+
+filtered_senator_inv <- filtered_senator_inv[order(filtered_senator_inv$txDate, decreasing = FALSE),]
+
+#export data to csv for reuse
+write.csv(filtered_senator_inv, "filtered_senator_inv.csv", row.names = FALSE)
+```
+
+Following the data import, we need to get the unique tickers of the stocks that are being traded by the senators.
+
+```{r}
+# filtered_senator_inv$asset.assetTicker contains the tickers to be updated
+
+# Old to new ticker mapping
+ticker_mapping <- c(ORCC = "OBDC", CWEN.A = "CWEN-A", HHC = "HHH", MTBC = "CCLD",
+                    MLHR = "MLKN", RLGY = "HOUS", ENOB = "RENB", VIAC = "PARA", 
+                    "ETWO-WS" = "ETWO", "LGF/A" = "LGF-A", "BRK/B"="BRK-B", "BF/A"="BF-A",
+                    "BF/B" = "BF-B", "LGF/B" = "LGF-B", "LEN/B" = "LEN-B")
+
+# Function to update each ticker in the dataset
+update_ticker <- function(ticker_with_suffix) {
+  # Remove the suffix and replace "/" with "-" to match the mapping keys
+  ticker <- gsub("-", "/", substr(ticker_with_suffix, 1, nchar(ticker_with_suffix) - 3))
+  
+  # If this modified ticker is in the mapping, return the new value; otherwise, return the original without modification
+  if(ticker %in% names(ticker_mapping)) {
+    return(ticker_mapping[ticker])
+  } else {
+    # If not in mapping, assume the original ticker (without the last 3 characters) is still valid
+    return(substr(ticker_with_suffix, 1, nchar(ticker_with_suffix) - 3))
+  }
+}
+
+# Apply this function to each ticker in the dataset
+filtered_senator_inv$asset.assetTicker <- sapply(filtered_senator_inv$asset.assetTicker, update_ticker)
+
+# Check the first few entries to confirm updates
+head(filtered_senator_inv$asset.assetTicker)
+```
+```{r}
+#Get the unique tickers of the stocks from the Trade Data
+tickers <- unique(filtered_senator_inv$asset.assetTicker)
+head(tickers)
+```
+
+Since the tickers being used by the CapitolTrades and Tiingo are different, it is necessary to edit them to be consistent by removing the trailing `:US`, which depicts the market type the stock belongs to.
+
+# Get Financial Data
+
+We leveraged the tiingo API to access comprehensive financial data on stocks uniquely traded by senators, as revealed by Capitol Trades API.
+
+``` {r}
+# Get stock prices for multiple stocks
+mult_stocks <- tq_get(tickers,
+                      get  = "stock.prices",
+                      from = "2021-01-01",
+                      to   = "2022-12-31")
+#head of data
+head(mult_stocks)
+```
+
+``` {r}
+# Compare between the given ticker list and the data from yahoo finance if there are any tickers for whom data hasn't been pulled
+ticker_mult_stock <- unique(mult_stocks$symbol)
+
+#the tickers present in senator data but not in the data from yahoo finance 
+ticker_diff <- setdiff(tickers,ticker_mult_stock)
+ticker_diff
+```
+
+``` {r}
+# Senator investments of the tickers that are not in Yahoo Finance Data
+senator_investments_df <- filtered_senator_inv %>%
+  filter(!(asset.assetTicker %in% ticker_diff))
+```
+
+
+# Export financial data to csv for reuse
+
+```{r}
+#export data as csv
+write.csv(senator_investments_df, "output_senator_trade_data.csv", row.names = FALSE)
+write.csv(mult_stocks, "output_stock_data.csv", row.names = FALSE)
+```
+
+# Data Analysis
+
+```{r}
+stock_returns_monthly <- fin_data %>%
+    group_by(symbol) %>%
+    tq_transmute(select     = adjusted, 
+                 mutate_fun = periodReturn, 
+                 period     = "monthly", 
+                 col_rename = "Ra")
+
+stock_returns_monthly%>%head()
+```
+
+# Basic Trend Exploring
+
+```{r}
+senator_investment_data <- read.csv("../Data/Scrubbed_All_CapitolTrades_Data.csv")
+```
+
+```{r}
+library(lubridate)
+# Convert data to data frame
+df <- data.frame(senator_investment_data)
+
+# Convert txDate to date format
+df$txDate <- ymd(df$txDate)
+
+# Group by month-year and sum value, calculating net transaction value
+monthly_value <- df %>%
+  mutate(month_year = floor_date(txDate, "month")) %>%
+  group_by(month_year) %>%
+  summarise(net_value = sum(case_when(txType == "buy" ~ value,
+                                       txType == "sell" ~ -value,
+                                       TRUE ~ 0)))
+
+# Plot
+ggplot(monthly_value, aes(x = month_year, y = net_value)) +
+  geom_line() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  labs(title = "Monthly Net Transaction Value of Politicians",
+       x = "Date",
+       y = "Total Transaction Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+library(treemap)
+
+# Summarize data to count the number of transactions per sector and politician
+summary_data <- aggregate(X_txId ~ issuer.sector + politician.lastName, df, length)
+
+# Rename the aggregated column to represent 'number of transactions'
+colnames(summary_data)[3] <- 'number_of_transactions'
+
+# Create a treemap
+treemap(summary_data,
+        index=c("politician.lastName", "issuer.sector"),
+        vSize="number_of_transactions",
+        title="Transactions by Politician and Sector",
+        fontsize.labels = c(12,10), # Font sizes for the labels
+        palette="RdYlGn", # Color palette
+        border.col="white", # Border color
+        border.lwds = 0.5 # Border line width
+)
+```
+
+```{r}
+library(treemap)
+library(plotly)
+# Calculate net transaction value for each sector
+sector_summary <- df %>%
+  mutate(value = if_else(txType == "buy", value, -value)) %>%  # Add value for 'buy', subtract for 'sell'
+  group_by(issuer.sector) %>%
+  summarise(net_value = sum(value)) %>%
+  mutate(abs_net_value = abs(net_value)) %>%
+  ungroup()
+
+# Rename the columns appropriately for the treemap
+colnames(sector_summary) <- c("sector", "net_value", "abs_net_value")
+
+sector_summary <- drop_na(sector_summary)
+
+# Create a treemap using the absolute net transaction values
+treemap(sector_summary,
+        index = "sector",
+        vSize = "abs_net_value",
+        title = "Net Transaction Value by Sector",
+        fontsize.labels = 11,
+        palette = "RdYlGn",
+        border.col = "white",
+        border.lwds = 0.5
+)
+
+```
+
+```{r}
+senator_investment_data%>%
+  group_by(politician.party)%>%
+  summarize(total_value=sum(price, na.rm=TRUE), total_transactions=n())
+```
+
+```{r}
+senator_investment_data
+head(senator_investment_data%>%
+  group_by(politician._stateId)%>%
+  summarize(total_value=sum(price, na.rm=TRUE), total_transactions=n())%>%
+  arrange(desc(total_value)))
+head(senator_investment_data%>%
+  group_by(politician._stateId)%>%
+  summarize(total_value=sum(price, na.rm=TRUE), total_transactions=n())%>%
+  arrange(total_value))
+```
+
+```{r}
+head(senator_investment_data%>%
+  group_by(politician._stateId)%>%
+  summarize(total_value=sum(price, na.rm=TRUE), total_transactions=n())%>%
+  arrange(desc(total_transactions)))
+head(senator_investment_data%>%
+  group_by(politician._stateId)%>%
+  summarize(total_value=sum(price, na.rm=TRUE), total_transactions=n())%>%
+  arrange(total_transactions))
+```
+
+```{r}
+summary(lm(price~politician.party, data=senator_investment_data))
+```
+```{r Data Cleaning for some EDA/simple models}
+clean_senator_inv <- senator_investments_df %>% separate(issuer.issuerTicker, c("Ticker", "Country"), ":") #Isolate ticker, can remove redundant country column
+clean_senator_inv <- clean_senator_inv[, !names(clean_senator_inv) %in% c("Country", "issuer.country")] #Remove country
+
+null_idx = which(is.na(clean_senator_inv$politician.dob))
+
+clean_senator_inv = clean_senator_inv[-null_idx, ]
+
+clean_senator_inv$politician.dob = as.Date(clean_senator_inv$politician.dob) #Convert to age for next function
+
+clean_senator_inv$Age = as.integer(age_calc(clean_senator_inv$politician.dob, units = "years")) #Calculate Age
+clean_senator_inv$price = round(clean_senator_inv$price, 2) #Round price
+clean_senator_inv$total = round(clean_senator_inv$price * clean_senator_inv$size, 2) #Find total investment
+clean_senator_inv
+```
+
+```{r EDA}
+trade_count = clean_senator_inv %>% group_by(politician.firstName, politician.lastName, politician.party,
+                                                    politician.gender, Age) %>% count(politician.gender) #Group by names and return counts
+names(trade_count)[names(trade_count) == 'n'] <- 'Num_Trades'
+head(trade_count[order(trade_count$Num_Trades, decreasing = TRUE), ], 10) #Top 10 traders 
+```
+```{r Plots}
+ggplot(trade_count, aes(x=Age)) + geom_histogram(col = I("white")) + ggtitle("Histogram of Trading Politician Ages") + ylab("Num of Trades")
+ggplot(trade_count, aes(x=Num_Trades)) + geom_histogram(bins = 50, col = I("white")) + ggtitle("Histogram of Trades Performed per Politician")
+ggplot(data = trade_count, aes(x=politician.gender, y=Num_Trades)) + geom_bar(stat = "identity") + xlab("Gender") + ylab("Count") + ggtitle("Trades per Gender")
+ggplot(data = trade_count, aes(x=politician.party, y=Num_Trades)) + geom_bar(stat = "identity") + xlab("Party Affiliation") + ylab("Count") + ggtitle("Trades per Party")
+```
+
+
+```{r Merging to run linear regression}
+model = lm((Num_Trades)~0+politician.party+politician.gender+Age, data = trade_count)
+log_model = lm(log(Num_Trades)~0+politician.party+politician.gender+Age, data = trade_count)
+summary(model)
+summary(log_model) #Shows the difference between log and natural
+```
+```{r Identify Outliers}
+cooks = cooks.distance(log_model)
+influential <- as.numeric(names(cooks)[(cooks > (4/111))]) #We put 111 because of num Rows in data
+cooks_idx = c(4, 22, 30, 56, 88) #Manually identify
+cooks_trade_counts = trade_count[-cooks_idx, ]
+```
+
+```{r Without cooks outliers}
+new_model = lm(log(Num_Trades)~0+politician.party+politician.gender+Age, data = cooks_trade_counts)
+summary(new_model)
+```
+```{r Regression based on party and just gender/age}
+party_regression = lm(log(Num_Trades)~0+politician.party, data = cooks_trade_counts)
+summary(party_regression) #Democrats slightly more likely to invest more times in the stock market
+gender_age_regression = lm(log(Num_Trades)~0+politician.gender+Age, data = cooks_trade_counts)
+summary(gender_age_regression)
+```
+```{r Total money invested model}
+investment_sums = clean_senator_inv %>% group_by(politician.firstName, politician.lastName, politician.party,
+                                                    politician.gender, politician._stateId, Age) %>% summarize(total_spent = sum(total, na.rm = TRUE), .groups = 'drop') 
+investment_sums #Group by names and return
+```
+
+```{r Plotting top spenders, try and fill color by party and then gender}
+investment_sums$"Name" = paste(investment_sums$politician.firstName,investment_sums$politician.lastName) #To get better labels
+
+options(scipen=10000)
+
+top_15_spenders = investment_sums[order(investment_sums$total_spent, decreasing = TRUE),][1:15, ]
+print(top_15_spenders)
+ggplot(top_15_spenders, aes(x = reorder(Name, total_spent), y = total_spent, fill = politician.party)) + geom_bar(stat = "identity") + coord_flip() + labs(title = "Top 15 Spenders in the Stock Market", x = "Politician", y = "Total Sum of Investments (Buy and Sell)")
+```
+```{r Model for spending}
+spending_model = lm(log(total_spent + 1)~politician.party + politician.gender + Age, data = investment_sums)
+summary(spending_model) 
+```
+Seems like democrats spend a lot more in the stock market, even though they were equally significant when measuring how many times each politician invested. 
+
+```{r Modeling total spent based on state}
+state_model = lm(log(total_spent+1)~0+politician._stateId, data = investment_sums)
+coefficients = tidy(state_model)
+```
+
+```{r Trying to color map based on significance value}
+library(maps)
+library(mapproj)
+library(tidyverse)
+library(scales)
+library(ggthemes)
+
+state_trade_values<-senator_investment_data%>%
+  group_by(politician._stateId)%>%
+  summarize(total_value=sum(price*size,na.rm=TRUE))
+
+state_trade_values$region<-tolower(state.name[match(toupper(state_trade_values$politician._stateId),state.abb)])
+
+states<-map_data("state")
+
+trade_values_geo<-merge(states,state_trade_values,sort=FALSE, by="region")
+trade_values_geo<-trade_values_geo[order(trade_values_geo$order),]
+
+
+
+ggplot()+
+  geom_polygon(data=trade_values_geo,aes(x=long, y=lat, group=group, fill=total_value),
+              colour = "black", size = 0.25)+
+  coord_map()+
+  scale_fill_distiller(labels=dollar,palette = 'Spectral', name = "Total Value")+
+  labs(title = "Total Transaction Value of Politicians' Trades by State") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = 'white', colour = 'white'))
+
+```
+
