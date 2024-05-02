@@ -54,7 +54,7 @@ library(ggthemes)
 
 ```{r}
 # Need to set the key so this R session can pass it to the Tiingo API
-api_key <-  "42118b51a26ca882ad30280464cbb58f5bc1631c"
+api_key <-  ""
 
 riingo_set_token(api_key)
 ```
